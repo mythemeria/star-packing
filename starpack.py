@@ -199,10 +199,10 @@ def exact_valid(state, height, aspect, base):
 
 
 @njit(cache=True)
-def closest_translation(a, b):
-  """Shortest vertex-to-edge translation that brings two disjoint polygons together."""
-  best_sq = 1e100
-  move_x, move_y = 0.0, 0.0
+def contact_translations(a, b, max_gap):
+  """Nearby vertex-edge contacts in distinct directions, shortest first."""
+  moves = np.zeros((4, 2), dtype=np.float64)
+  gaps = np.full(4, 1e100, dtype=np.float64)
 
   for reverse in range(2):
     if reverse == 0:
@@ -217,13 +217,32 @@ def closest_translation(a, b):
         vx, vy = bx - ax, by - ay
         length_sq = vx * vx + vy * vy
         t = 0.0 if length_sq == 0.0 else max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / length_sq))
-        dx, dy = ax + t * vx - px, ay + t * vy - py
-        gap_sq = dx * dx + dy * dy
-        if gap_sq < best_sq:
-          best_sq = gap_sq
-          move_x, move_y = sign * dx, sign * dy
+        dx, dy = sign * (ax + t * vx - px), sign * (ay + t * vy - py)
+        gap = math.sqrt(dx * dx + dy * dy)
+        if not 1e-7 < gap < max_gap:
+          continue
 
-  return move_x, move_y, math.sqrt(best_sq)
+        # Keep alternatives that lead to different contacts, rather than four
+        # nearly identical vertices on the same side of the other star.
+        slot = -1
+        for q in range(4):
+          if gaps[q] < 1e50 and (dx * moves[q, 0] + dy * moves[q, 1]) > 0.95 * gap * gaps[q]:
+            slot = q
+            break
+        if slot >= 0 and gap >= gaps[slot]:
+          continue
+        if slot < 0:
+          slot = 3
+          if gap >= gaps[slot]:
+            continue
+        for q in range(slot, 3):
+          gaps[q], moves[q] = gaps[q + 1], moves[q + 1]
+        while slot > 0 and gap < gaps[slot - 1]:
+          gaps[slot], moves[slot] = gaps[slot - 1], moves[slot - 1]
+          slot -= 1
+        gaps[slot], moves[slot, 0], moves[slot, 1] = gap, dx, dy
+
+  return moves, gaps
 
 
 def contact_count(state, height, aspect, base, tolerance=1e-6):
@@ -237,6 +256,55 @@ def contact_count(state, height, aspect, base, tolerance=1e-6):
       if np.sum((state[i, :2] - state[j, :2]) ** 2) <= (2.0 + tolerance) ** 2:
         count += 2 * (polygon_distance_sq(poly, polygons[j]) <= tolerance ** 2)
   return count
+
+
+@njit(cache=True)
+def contact_pose_fits(pose, i, state, polygons, height, aspect, base):
+  poly = make_polygon(pose, base)
+  for vertex in poly:
+    if not (0.0 <= vertex[0] <= height * aspect and 0.0 <= vertex[1] <= height):
+      return False
+  for j in range(len(state)):
+    if i == j:
+      continue
+    dx, dy = pose[0] - state[j, 0], pose[1] - state[j, 1]
+    if dx * dx + dy * dy < 4.0 and polygons_overlap(poly, polygons[j]):
+      return False
+  return True
+
+
+def feasible_contact_move(state, polygons, i, move, height, aspect, base):
+  """Advance towards a contact, stopping at the first obstruction or wall."""
+  distance = float(np.linalg.norm(move))
+  if distance <= 1e-7:
+    return None
+
+  def fits(fraction):
+    pose = state[i].copy()
+    pose[:2] += move * fraction
+    return contact_pose_fits(pose, i, state, polygons, height, aspect, base)
+
+  # A small offset avoids treating floating point boundary ambiguity as an
+  # overlap. Binary search turns a blocked target into a reachable tangency.
+  full = max(0.0, 1.0 - 1e-9 / distance)
+  if fits(full):
+    low = full
+  else:
+    low, high = 0.0, full
+    for _ in range(38):
+      middle = (low + high) * 0.5
+      if fits(middle):
+        low = middle
+      else:
+        high = middle
+  if low * distance <= 1e-7:
+    return None
+  trial = state.copy()
+  trial[i, :2] += move * low
+  packed, candidate_height = tight_box(trial, aspect, base)
+  if candidate_height > height + 1e-11 or not exact_valid(packed, candidate_height, aspect, base):
+    return None
+  return packed, candidate_height
 
 
 def snap_contacts(state, aspect, base, max_gap=CONTACT_RANGE, rounds=2):
@@ -254,21 +322,20 @@ def snap_contacts(state, aspect, base, max_gap=CONTACT_RANGE, rounds=2):
       for j in range(len(state)):
         if i == j or np.sum((state[i, :2] - state[j, :2]) ** 2) > (2.0 + max_gap) ** 2:
           continue
-        dx, dy, gap = closest_translation(polygons[i], polygons[j])
-        if not 1e-7 < gap < max_gap:
-          continue
-        trial = state.copy()
-        trial[i, :2] += np.array((dx, dy)) * (1.0 - 1e-8 / gap)
-        packed, trial_height = tight_box(trial, aspect, base)
-        if trial_height > height and trial_height - height < 1e-12 and exact_valid(packed, height, aspect, base):
-          trial_height = height
-        if trial_height > height or not exact_valid(packed, trial_height, aspect, base):
-          continue
-        trial_contacts = contact_count(packed, trial_height, aspect, base)
-        if trial_height < height - 1e-9 or trial_contacts > contacts:
-          state, height, contacts = packed, trial_height, trial_contacts
-          polygons = build_polygons(state, base)
-          changed = sweep_changed = True
+        moves, gaps = contact_translations(polygons[i], polygons[j], max_gap)
+        for move, gap in zip(moves, gaps):
+          if gap >= max_gap:
+            break
+          result = feasible_contact_move(state, polygons, i, move, height, aspect, base)
+          if result is None:
+            continue
+          packed, trial_height = result
+          trial_contacts = contact_count(packed, trial_height, aspect, base)
+          if trial_height < height - 1e-9 or trial_contacts > contacts:
+            state, height, contacts = packed, trial_height, trial_contacts
+            polygons = build_polygons(state, base)
+            changed = sweep_changed = True
+            break
 
       # A star can also be brought exactly onto a wall without changing angle.
       for axis, limit in ((0, height * aspect), (1, height)):
@@ -277,13 +344,12 @@ def snap_contacts(state, aspect, base, max_gap=CONTACT_RANGE, rounds=2):
           offset = wall - extent
           if not 1e-7 < abs(offset) < max_gap:
             continue
-          trial = state.copy()
-          trial[i, axis] += offset - math.copysign(1e-8, offset)
-          packed, trial_height = tight_box(trial, aspect, base)
-          if trial_height > height and trial_height - height < 1e-12 and exact_valid(packed, height, aspect, base):
-            trial_height = height
-          if trial_height > height or not exact_valid(packed, trial_height, aspect, base):
+          move = np.zeros(2)
+          move[axis] = offset
+          result = feasible_contact_move(state, polygons, i, move, height, aspect, base)
+          if result is None:
             continue
+          packed, trial_height = result
           trial_contacts = contact_count(packed, trial_height, aspect, base)
           if trial_height < height - 1e-9 or trial_contacts > contacts:
             state, height, contacts = packed, trial_height, trial_contacts
@@ -708,6 +774,7 @@ def main():
     
     best_height = height
     best_state = state.copy()
+    best_contacts = contact_count(state, height, aspect, base)
     
     if rank == 0:
       print(f"loaded packing: H={height:.12f} W={height * aspect:.12f} A={height * height * aspect:.12f}", flush=True)
@@ -728,6 +795,7 @@ def main():
     state = initialize_state(rng, height, aspect, symmetry, args.count)
     best_height = math.inf
     best_state = None
+    best_contacts = -1
 
   dummy = initialize_state(rng, max(height, 16.0), aspect, symmetry, args.count)
   dummy_polys = build_polygons(dummy, base)
@@ -743,14 +811,18 @@ def main():
     candidate, energy, valid = anneal(rng, state, height, aspect, args.iterations, temperature,
                                       base, symmetry, args.contact_steps)
     candidate, candidate_height, valid = polish_candidate(candidate, aspect, base, best_height, args.snap_rounds)
-    local_record = (candidate_height if valid and candidate_height < best_height else math.inf, rank)
-    global_height, global_rank = min(comm.allgather(local_record))
+    candidate_contacts = contact_count(candidate, candidate_height, aspect, base) if valid else -1
+    better = valid and (candidate_height < best_height or (
+      candidate_height == best_height and candidate_contacts > best_contacts))
+    local_record = (candidate_height if better else math.inf, -candidate_contacts, rank)
+    global_height, neg_contacts, global_rank = min(comm.allgather(local_record))
 
     if math.isfinite(global_height):
       source = candidate.copy() if rank == global_rank else np.empty((args.count, 3), dtype=np.float64)
       comm.Bcast(source, root=global_rank)
       best_height = global_height
       best_state = source.copy()
+      best_contacts = -neg_contacts
       
       if rank == global_rank:
         print(f"new best packing: H={global_height:.12f} W={global_height * aspect:.12f} A={global_height * global_height * aspect:.12f}", flush=True)
@@ -788,6 +860,7 @@ def main():
         source = jostled.copy() if rank == 0 else np.empty((args.count, 3), dtype=np.float64)
         comm.Bcast(source, root=0)
         best_state = source.copy()
+        best_contacts = contact_count(source, best_height, aspect, base)
         if rank == 0:
           print(f"GPU jostle improved packing: H={best_height:.12f} W={best_height * aspect:.12f}", flush=True)
           save_solution(json_filename, image_filename, source, best_height, aspect, symbol, base, rank, seed,
