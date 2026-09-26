@@ -814,6 +814,73 @@ def initialize_state(rng, height, aspect, symmetry, count):
   return state
 
 
+def regular_tiling_seed(count, aspect, base, symbol):
+  """Build a valid lattice seed; interlock alternating rows of pentagrams."""
+  if symbol == "{5/2}" and count >= 5:
+    columns = max(1, round(math.sqrt(count * aspect / 3.0)))
+    down = make_polygon(np.array((0.0, 0.0, math.pi)), base)
+
+    def contact_height(x, theta, direction):
+      lower, upper = 0.0, 2.0
+      for _ in range(42):
+        middle = (lower + upper) * 0.5
+        other = make_polygon(np.array((x, direction * middle, theta)), base)
+        if polygons_overlap(down, other):
+          lower = middle
+        else:
+          upper = middle
+      return upper
+
+    same_row_pitch = contact_height(0.0, math.pi, -1)
+
+    def build(pitch):
+      down_step = contact_height(pitch * 0.5, 0.0, -1) + 1e-8
+      up_step = contact_height(pitch * 0.5, 0.0, 1) + 1e-8
+      row_pitch = max(same_row_pitch, down_step + up_step) + 1e-8
+      poses = []
+      for pair in range(math.ceil(count / (2 * columns))):
+        for row in range(2):
+          for col in range(columns):
+            if len(poses) == count:
+              break
+            poses.append(((col + row * 0.5) * pitch, -pair * row_pitch - row * down_step,
+                          math.pi if row == 0 else 0.0))
+      return tight_box(np.asarray(poses, dtype=np.float64), aspect, base)
+
+    left, right = 2.05, 2.60
+    ratio = (math.sqrt(5.0) - 1.0) * 0.5
+    a = right - ratio * (right - left)
+    b = left + ratio * (right - left)
+    ha, hb = build(a)[1], build(b)[1]
+    for _ in range(36):
+      if ha < hb:
+        right, b, hb = b, a, ha
+        a = right - ratio * (right - left)
+        ha = build(a)[1]
+      else:
+        left, a, ha = a, b, hb
+        b = left + ratio * (right - left)
+        hb = build(b)[1]
+    state, height = build((left + right) * 0.5)
+    if exact_valid(state, height, aspect, base):
+      return state, height
+
+  # A staggered triangular lattice keeps every pair of unit circumcircles
+  # disjoint, including symbols without the pentagram's interlocking pattern.
+  columns = max(1, round(math.sqrt(count * aspect * math.sqrt(3.0) / 2.0)))
+  spacing = 2.0 + 1e-7
+  poses = np.empty((count, 3), dtype=np.float64)
+  for i in range(count):
+    row, col = divmod(i, columns)
+    poses[i] = ((col + (row % 2) * 0.5) * spacing,
+                -row * spacing * math.sqrt(3.0) * 0.5,
+                (row % 2) * math.pi / (len(base) // 2))
+  state, height = tight_box(poses, aspect, base)
+  if not exact_valid(state, height, aspect, base):
+    raise ValueError("Could not construct a valid regular tiling")
+  return state, height
+
+
 def anneal(rng, state, height, aspect, iterations, initial_temp, base, symmetry, contact_steps):
   state = state.copy()
   polys = build_polygons(state, base)
@@ -1050,7 +1117,7 @@ def main():
   parser.add_argument("count", type=int, help="Number of stars to pack")
   parser.add_argument("--aspect", type=float, default=None, help="Width / height; default 1:1, or loaded aspect")
   parser.add_argument("--us-flag", action="store_true", help="Use the US canton aspect and render white stars on a full US flag; overrides aspect and colours")
-  parser.add_argument("--start-height", type=float, default=16.0)
+  parser.add_argument("--start-height", type=float, default=None, help="Initial search height when starting without a saved packing; defaults to the tiling height")
   parser.add_argument("--iterations", type=int, default=100000, help="Annealing iterations per epoch")
   parser.add_argument("--contact-steps", type=int, default=2000, help="Extra annealing steps after the first valid packing")
   parser.add_argument("--snap-rounds", type=int, default=2, help="Nearby contact-snapping sweeps per improvement; 0 disables")
@@ -1087,7 +1154,8 @@ def main():
   if not (math.isfinite(args.jostle_compression) and 0.0 < args.jostle_compression < 1.0):
     parser.error("--jostle-compression must be finite and between 0 and 1")
 
-  if not 0.0 < args.shrink < 1.0 or args.start_height <= 0:
+  if not 0.0 < args.shrink < 1.0 or (args.start_height is not None and
+                                    not (math.isfinite(args.start_height) and args.start_height > 0)):
     parser.error("--shrink must be between 0 and 1, and --start-height must be positive")
 
   if args.aspect is not None and not (math.isfinite(args.aspect) and args.aspect > 0):
@@ -1191,11 +1259,26 @@ def main():
 
   else:
     aspect = args.aspect if args.aspect is not None else DEFAULT_ASPECT
-    height = args.start_height
-    state = initialize_state(rng, height, aspect, symmetry, args.count)
-    best_height = math.inf
-    best_state = None
-    best_compactness = -math.inf
+    if rank == 0:
+      try:
+        seed_state, seed_height = regular_tiling_seed(args.count, aspect, base, symbol)
+        print(f"regular tiling seed: H={seed_height:.12f} W={seed_height * aspect:.12f} A={seed_height * seed_height * aspect:.12f}", flush=True)
+        save_solution(json_filename, image_filename, seed_state, seed_height, aspect, symbol, base, rank, seed,
+                      args.image_width, args.background, args.border, args.fill, args.us_flag)
+        seed_error = None
+      except (OSError, ValueError) as exc:
+        seed_state, seed_height, seed_error = None, None, str(exc)
+    else:
+      seed_state, seed_height, seed_error = None, None, None
+    seed_error = comm.bcast(seed_error, root=0)
+    if seed_error is not None:
+      raise ValueError(seed_error)
+    state, best_height = comm.bcast((seed_state, seed_height) if rank == 0 else None, root=0)
+    best_state = state.copy()
+    best_compactness = compactness(state)
+    height = args.start_height if args.start_height is not None else best_height * args.shrink
+    state = state.copy()
+    state[:, :2] *= height / best_height
 
   dummy = initialize_state(rng, max(height, 16.0), aspect, symmetry, args.count)
   dummy_polys = build_polygons(dummy, base)
