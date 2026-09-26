@@ -1,3 +1,11 @@
+# Star packing
+
+I made this for fun on a Saturday and put it online in case someone else wants to work on packing stars into rectangles. The repository includes example packings and a program that searches for smaller enclosing rectangles.
+
+This is an incomplete experiment. The included packings are valid numerical examples, not proven optimal solutions. From what I've seen, the program sometimes misses better arrangements that are fairly easy to spot, so I expect many of these packings can be improved. A few look close to especially good arrangements; it may be possible to describe their star-to-star and star-to-edge contacts precisely and turn them into exact constructions. I haven't done that or established lower bounds.
+
+If this problem interests you, the code and example solutions are here to use and improve. Better packings, exact constructions, proofs, and improvements to the search are all welcome.
+
 Example usage (Liberty Jack for a US flag):
 
 `python starpack.py '{5/2}' 50 --background '#00205B' --border '#FFFFFF' --fill '#FFFFFF' --aspect 1.408450704225352`
