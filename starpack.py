@@ -11,6 +11,11 @@ from PIL import Image, ImageDraw
 
 
 DEFAULT_ASPECT = 1.0
+US_FLAG_ASPECT = 1.9
+US_CANTON_ASPECT = 0.76 * 13.0 / 7.0
+US_FLAG_RED = "#B22234"
+US_FLAG_BLUE = "#3C3B6E"
+US_FLAG_WHITE = "#FFFFFF"
 OVERLAP_WEIGHT = 20.0
 CLEARANCE = 0.0
 CONTACT_RANGE = 0.25
@@ -956,15 +961,34 @@ def gpu_jostle(best_state, best_height, aspect, base, steps, rounds, compression
 
 
 def render_packing_image(filename, state, height, aspect, base, image_width=2000,
-                         background="#FFFFFF", border="#000000", fill="#808080"):
-  image_height = max(1, round(image_width / aspect))
-  image = Image.new("RGB", (image_width, image_height), background)
+                         background="#FFFFFF", border="#000000", fill="#808080", us_flag=False):
+  image_height = max(1, round(image_width / (US_FLAG_ASPECT if us_flag else aspect)))
+  image = Image.new("RGB", (image_width, image_height), US_FLAG_RED if us_flag else background)
   draw = ImageDraw.Draw(image)
+  if us_flag:
+    for stripe in range(1, 13, 2):
+      top = round(stripe * image_height / 13)
+      bottom = round((stripe + 1) * image_height / 13)
+      draw.rectangle((0, top, image_width - 1, bottom - 1), fill=US_FLAG_WHITE)
+    canton_width = round(image_height * 0.76)
+    canton_height = round(image_height * 7 / 13)
+    canton = Image.new("RGB", (canton_width, canton_height), US_FLAG_BLUE)
+    canton_draw = ImageDraw.Draw(canton)
+    scale = min(canton_width / (height * aspect), canton_height / height)
+    offset_x = (canton_width - height * aspect * scale) / 2
+    offset_y = (canton_height - height * scale) / 2
   polys = build_polygons(state, base)
 
   for poly in polys:
-    points = [(float(x * image_width / (height * aspect)), float(image_height - y * image_height / height)) for x, y in poly]
-    draw.polygon(points, fill=fill, outline=border, width=max(1, round(image_width / 1000)))
+    if us_flag:
+      points = [(float(offset_x + x * scale), float(canton_height - offset_y - y * scale)) for x, y in poly]
+      canton_draw.polygon(points, fill=US_FLAG_WHITE, outline=US_FLAG_WHITE)
+    else:
+      points = [(float(x * image_width / (height * aspect)), float(image_height - y * image_height / height)) for x, y in poly]
+      draw.polygon(points, fill=fill, outline=border, width=max(1, round(image_width / 1000)))
+
+  if us_flag:
+    image.paste(canton, (0, 0))
 
   temp = filename + ".tmp.png"
   image.save(temp, format="PNG")
@@ -972,7 +996,7 @@ def render_packing_image(filename, state, height, aspect, base, image_width=2000
 
 
 def save_solution(json_filename, image_filename, state, height, aspect, symbol, base, rank, seed,
-                  image_width, background, border, fill):
+                  image_width, background, border, fill, us_flag=False):
   obj = {
     "schlafli_symbol": symbol,
     "stars": len(state),
@@ -992,7 +1016,7 @@ def save_solution(json_filename, image_filename, state, height, aspect, symbol, 
     json.dump(obj, stream, indent=2)
 
   os.replace(temp, json_filename)
-  render_packing_image(image_filename, state, height, aspect, base, image_width, background, border, fill)
+  render_packing_image(image_filename, state, height, aspect, base, image_width, background, border, fill, us_flag)
 
 
 def load_solution(filename, symbol, count):
@@ -1025,6 +1049,7 @@ def main():
   parser.add_argument("symbol", type=parse_symbol, help="SchlÃƒÂ¤fli symbol, e.g. '{5/2}' or 5/2")
   parser.add_argument("count", type=int, help="Number of stars to pack")
   parser.add_argument("--aspect", type=float, default=None, help="Width / height; default 1:1, or loaded aspect")
+  parser.add_argument("--us-flag", action="store_true", help="Use the US canton aspect and render white stars on a full US flag; overrides aspect and colours")
   parser.add_argument("--start-height", type=float, default=16.0)
   parser.add_argument("--iterations", type=int, default=100000, help="Annealing iterations per epoch")
   parser.add_argument("--contact-steps", type=int, default=2000, help="Extra annealing steps after the first valid packing")
@@ -1067,14 +1092,17 @@ def main():
 
   if args.aspect is not None and not (math.isfinite(args.aspect) and args.aspect > 0):
     parser.error("--aspect must be finite and positive")
+  if args.us_flag:
+    args.aspect = US_CANTON_ASPECT
 
   n, k = args.symbol
   symbol = f"{{{n}/{k}}}"
   base = make_base_star(n, k)
   symmetry = 2.0 * math.pi / n
   output_dir = "results"
-  json_filename = os.path.join(output_dir, f"{n}-{k}_{args.count}.json")
-  image_filename = os.path.join(output_dir, f"{n}-{k}_{args.count}.png")
+  stem = f"{n}-{k}_{args.count}"
+  json_filename = os.path.join(output_dir, f"{stem}{'_us_flag' if args.us_flag else ''}.json")
+  image_filename = os.path.join(output_dir, f"{stem}{'_us_flag' if args.us_flag else ''}.png")
 
   comm = communicator()
   rank, size = comm.Get_rank(), comm.Get_size()
@@ -1097,7 +1125,10 @@ def main():
   if rank == 0:
     try:
       os.makedirs(output_dir, exist_ok=True)
-      loaded = load_solution(json_filename, symbol, args.count) if os.path.exists(json_filename) else None
+      loaded_filename = json_filename
+      if args.us_flag and not os.path.exists(loaded_filename):
+        loaded_filename = os.path.join(output_dir, f"{stem}.json")
+      loaded = load_solution(loaded_filename, symbol, args.count) if os.path.exists(loaded_filename) else None
       load_error = None
 
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -1115,7 +1146,13 @@ def main():
 
   if loaded is not None:
     state, height, aspect = loaded
-    if args.aspect is not None and not math.isclose(args.aspect, aspect, abs_tol=1e-12):
+    converted = args.us_flag and not math.isclose(args.aspect, aspect, rel_tol=0, abs_tol=1e-12)
+    if converted:
+      if not exact_valid(state, height, aspect, base):
+        raise ValueError("Loaded packing is not valid")
+      aspect = args.aspect
+      state, height = tight_box(state, aspect, base)
+    elif args.aspect is not None and not math.isclose(args.aspect, aspect, abs_tol=1e-12):
       raise ValueError(f"Loaded aspect {aspect} does not match --aspect {args.aspect}")
     if rank == 0:
       try:
@@ -1124,7 +1161,7 @@ def main():
         state, tight_height = tight_box(state, aspect, base)
         if not exact_valid(state, tight_height, aspect, base):
           raise ValueError("Loaded packing is not valid after tightening")
-        tightened = tight_height < height
+        tightened = converted or (args.us_flag and not os.path.exists(json_filename)) or tight_height < height
         height = tight_height
         if args.snap_rounds:
           state, height, snapped = snap_contacts(state, aspect, base, rounds=args.snap_rounds)
@@ -1132,10 +1169,10 @@ def main():
         print(f"loaded packing: H={height:.12f} W={height * aspect:.12f} A={height * height * aspect:.12f}", flush=True)
         if tightened:
           save_solution(json_filename, image_filename, state, height, aspect, symbol, base, rank, seed,
-                        args.image_width, args.background, args.border, args.fill)
+                        args.image_width, args.background, args.border, args.fill, args.us_flag)
         else:
           render_packing_image(image_filename, state, height, aspect, base, args.image_width,
-                               args.background, args.border, args.fill)
+                               args.background, args.border, args.fill, args.us_flag)
         load_error = None
       except (OSError, ValueError) as exc:
         load_error = str(exc)
@@ -1207,7 +1244,7 @@ def main():
         if rank == global_rank:
           print(f"new best packing: H={global_height:.12f} W={global_height * aspect:.12f} A={global_height * global_height * aspect:.12f}", flush=True)
           save_solution(json_filename, image_filename, source, global_height, aspect, symbol, base, rank, seed,
-                        args.image_width, args.background, args.border, args.fill)
+                        args.image_width, args.background, args.border, args.fill, args.us_flag)
 
         height = global_height * args.shrink
         state = source.copy()
@@ -1256,7 +1293,7 @@ def main():
           if rank == 0:
             print(f"GPU jostle improved packing: H={best_height:.12f} W={best_height * aspect:.12f}", flush=True)
             save_solution(json_filename, image_filename, source, best_height, aspect, symbol, base, rank, seed,
-                          args.image_width, args.background, args.border, args.fill)
+                          args.image_width, args.background, args.border, args.fill, args.us_flag)
           height = best_height * args.shrink
           state = source.copy()
           state[:, :2] *= args.shrink
@@ -1284,7 +1321,7 @@ def main():
           if rank == 0:
             print(f"straightened {straightened_count} stars: H={best_height:.12f} W={best_height * aspect:.12f}", flush=True)
             save_solution(json_filename, image_filename, source, best_height, aspect, symbol, base, rank, seed,
-                          args.image_width, args.background, args.border, args.fill)
+                          args.image_width, args.background, args.border, args.fill, args.us_flag)
           height = best_height * args.shrink
           state = source.copy()
           state[:, :2] *= args.shrink
