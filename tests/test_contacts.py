@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import numpy as np
@@ -36,6 +37,28 @@ class ContactTests(unittest.TestCase):
     self.assertTrue(starpack.exact_valid(packed, new_height, 2.0, self.base))
     for index in (2, 3):
       self.assertGreater(np.linalg.norm(packed[index, :2] - state[index, :2]), 1e-5)
+
+  def test_straighten_near_upright_without_expanding_box(self):
+    symmetry = 2.0 * math.pi / 5.0
+    state = np.array([[1.0, 1.0, 0.02], [3.1, 1.0, -0.015]])
+    state, height = starpack.tight_box(state, 1.0, self.base)
+    packed, new_height, count = starpack.straighten_stars(
+      state, height, 1.0, self.base, symmetry, math.radians(3.0))
+    self.assertEqual(count, 2)
+    self.assertLessEqual(new_height, height)
+    self.assertTrue(starpack.exact_valid(packed, new_height, 1.0, self.base))
+    self.assertTrue(np.array_equal(packed[:, 2], np.zeros(2)))
+
+  def test_straighten_wraps_rotational_symmetry(self):
+    symmetry = 2.0 * math.pi / 5.0
+    state = np.array([[1.25, 1.25, symmetry - 0.02]])
+    height = 2.5
+    packed, new_height, count = starpack.straighten_stars(
+      state, height, 1.0, self.base, symmetry, math.radians(3.0))
+    self.assertEqual(count, 1)
+    self.assertEqual(packed[0, 2], symmetry)
+    self.assertLessEqual(new_height, height)
+    self.assertTrue(starpack.exact_valid(packed, new_height, 1.0, self.base))
 
 
 if __name__ == "__main__":

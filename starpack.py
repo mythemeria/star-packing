@@ -660,6 +660,49 @@ def snap_contacts(state, aspect, base, max_gap=CONTACT_RANGE, rounds=2):
   return state, height, changed
 
 
+def straighten_stars(state, height, aspect, base, symmetry, max_angle):
+  """Snap nearly upright stars to exact symmetry angles when the box remains valid."""
+  if max_angle <= 0.0:
+    return state, height, 0
+  state = state.copy()
+  polygons = build_polygons(state, base)
+  straightened = 0
+  tolerance = min(max_angle, symmetry * 0.25)
+
+  for i in range(len(state)):
+    offset = (state[i, 2] + symmetry * 0.5) % symmetry - symmetry * 0.5
+    if not 1e-10 < abs(offset) <= tolerance:
+      continue
+    pose = state[i].copy()
+    pose[2] = round(pose[2] / symmetry) * symmetry
+    trial = state.copy()
+    trial[i] = pose
+    packed, trial_height = tight_box(trial, aspect, base)
+    if trial_height <= height + 1e-11 and exact_valid(packed, trial_height, aspect, base):
+      result = packed, trial_height
+    else:
+      rotated = make_polygon(pose, base) - pose[:2]
+      lower = -rotated.min(axis=0)
+      upper = np.array((height * aspect, height)) - rotated.max(axis=0)
+      if np.any(lower > upper):
+        continue
+      pose[:2] = np.clip(pose[:2], lower, upper)
+      result = repair_blockers(state, i, pose, height, aspect, base,
+                               reference_polygons=polygons)
+    if result is None:
+      continue
+    packed, trial_height = result
+    if trial_height > height:
+      if not exact_valid(packed, height, aspect, base):
+        continue
+      trial_height = height
+    state, height = packed, trial_height
+    polygons = build_polygons(state, base)
+    straightened += 1
+
+  return state, height, straightened
+
+
 def polish_candidate(state, aspect, base, best_height, snap_rounds):
   state, height = tight_box(state, aspect, base)
   valid = height < best_height + CONTACT_RANGE and exact_valid(state, height, aspect, base)
@@ -990,6 +1033,8 @@ def main():
   parser.add_argument("--exchange-every", type=int, default=10, help="Print progress every N epochs")
   parser.add_argument("--workers", type=int, default=0, help="Local CPU processes; 0 uses available CPUs when MPI has one rank")
   parser.add_argument("--epochs", type=int, default=0, help="Stop after N epochs; 0 continues indefinitely")
+  parser.add_argument("--straighten-every", type=int, default=10, help="Attempt near-upright orientations every N epochs; 0 disables")
+  parser.add_argument("--straighten-angle", type=float, default=3.0, help="Maximum angle from upright in degrees")
   parser.add_argument("--jostle-every", type=int, default=10, help="Run GPU physics every N epochs; 0 disables it")
   parser.add_argument("--jostle-steps", type=int, default=200, help="Contact projection steps per compression attempt")
   parser.add_argument("--jostle-rounds", type=int, default=30, help="Compression attempts per GPU pass")
@@ -1003,8 +1048,10 @@ def main():
 
   if args.count <= 0:
     parser.error("count must be positive")
-  if args.workers < 0 or args.epochs < 0:
-    parser.error("--workers and --epochs must be nonnegative")
+  if args.workers < 0 or args.epochs < 0 or args.straighten_every < 0:
+    parser.error("--workers, --epochs and --straighten-every must be nonnegative")
+  if not (math.isfinite(args.straighten_angle) and args.straighten_angle >= 0):
+    parser.error("--straighten-angle must be finite and nonnegative")
 
   if args.iterations <= 0 or args.exchange_every <= 0 or args.image_width <= 0:
     parser.error("--iterations, --exchange-every and --image-width must be positive")
@@ -1208,6 +1255,34 @@ def main():
           best_compactness = compactness(source)
           if rank == 0:
             print(f"GPU jostle improved packing: H={best_height:.12f} W={best_height * aspect:.12f}", flush=True)
+            save_solution(json_filename, image_filename, source, best_height, aspect, symbol, base, rank, seed,
+                          args.image_width, args.background, args.border, args.fill)
+          height = best_height * args.shrink
+          state = source.copy()
+          state[:, :2] *= args.shrink
+          if pool is not None:
+            for index in range(workers):
+              worker_states[index] = state.copy()
+              if index:
+                worker_states[index][:, :2] += rng.normal(0.0, 0.03, (args.count, 2))
+                worker_states[index][:, 2] = (worker_states[index][:, 2] +
+                                               rng.normal(0.0, 0.03, args.count)) % symmetry
+
+      if args.straighten_every and epoch % args.straighten_every == 0:
+        if rank == 0 and best_state is not None:
+          straightened_state, straightened_height, straightened_count = straighten_stars(
+            best_state, best_height, aspect, base, symmetry, math.radians(args.straighten_angle))
+        else:
+          straightened_count = 0
+        changed = comm.bcast(straightened_count > 0, root=0)
+        if changed:
+          best_height = comm.bcast(straightened_height if rank == 0 else None, root=0)
+          source = straightened_state.copy() if rank == 0 else np.empty((args.count, 3), dtype=np.float64)
+          comm.Bcast(source, root=0)
+          best_state = source.copy()
+          best_compactness = compactness(source)
+          if rank == 0:
+            print(f"straightened {straightened_count} stars: H={best_height:.12f} W={best_height * aspect:.12f}", flush=True)
             save_solution(json_filename, image_filename, source, best_height, aspect, symbol, base, rank, seed,
                           args.image_width, args.background, args.border, args.fill)
           height = best_height * args.shrink
